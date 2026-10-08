@@ -238,6 +238,7 @@ typedef struct ior_iocp_op {
 	uint32_t accept_nchildren;
 
 	_Atomic int state; // IOCP_OP_*
+	_Atomic bool packet_taken; // so the pump cannot stage the op twice (iocp_packet_op)
 
 	// Free list linkage (preserved across prep_*)
 	struct ior_iocp_op *next_free;
@@ -349,6 +350,10 @@ typedef struct iocp_pump {
 // Completion key of the packet that tells the pump thread to exit.
 #define IOCP_PUMP_STOP_KEY ((ULONG_PTR) - 2)
 
+// Foreign packets (iocp_packet_op) one dequeue drops before it returns
+// -EAGAIN, so a 0 ms peek returns however fast they come.
+#define IOCP_FOREIGN_PACKETS_MAX 64
+
 /* QPC frequency, initialized once during backend init.
  *
  * Stored as an atomic so that the publishing thread's write is observed with
@@ -365,8 +370,10 @@ typedef struct ior_ctx_iocp {
 	HANDLE iocp_handle;
 
 	// Operation pool: grown in chunks as more ops are staged or in flight,
-	// which nothing bounds but memory, as on io_uring.
-	iocp_op_chunk *op_chunks;
+	// which nothing bounds but memory, as on io_uring. Published with release:
+	// iocp_packet_op walks the chunks without pool_lock while the poller thread
+	// may grow the pool.
+	_Atomic(iocp_op_chunk *) op_chunks;
 	uint32_t pool_size; // ops in all chunks
 
 	/*
@@ -696,12 +703,12 @@ static int grow_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 		return -ENOMEM;
 	}
 	chunk->count = size;
-	chunk->next = ctx->op_chunks;
-	ctx->op_chunks = chunk;
+	chunk->next = atomic_load_explicit(&ctx->op_chunks, memory_order_relaxed);
 	for (uint32_t i = 0; i < size; i++) {
 		chunk->ops[i].next_free = ctx->free_list_head;
 		ctx->free_list_head = &chunk->ops[i];
 	}
+	atomic_store_explicit(&ctx->op_chunks, chunk, memory_order_release);
 	ctx->pool_size += size;
 	ctx->free_count += size;
 	return 0;
@@ -709,11 +716,56 @@ static int grow_op_pool(ior_ctx_iocp *ctx, uint32_t size)
 
 static void free_op_pool(ior_ctx_iocp *ctx)
 {
-	while (ctx->op_chunks) {
-		iocp_op_chunk *next = ctx->op_chunks->next;
-		free(ctx->op_chunks);
-		ctx->op_chunks = next;
+	iocp_op_chunk *chunk = atomic_load_explicit(&ctx->op_chunks, memory_order_relaxed);
+	while (chunk) {
+		iocp_op_chunk *next = chunk->next;
+		free(chunk);
+		chunk = next;
 	}
+	atomic_store_explicit(&ctx->op_chunks, NULL, memory_order_relaxed);
+}
+
+/*
+ * The op a packet dequeued from the port completes, or NULL for a foreign
+ * packet: a handle passed to another process stays associated with this
+ * port, so that process's overlapped I/O on it posts here, with an
+ * OVERLAPPED that is an address in its memory. Nothing in a packet tells
+ * one that lands exactly on a slot with a request in flight from that
+ * request's own; such a one is taken for it.
+ */
+static ior_iocp_op *iocp_packet_op(ior_ctx_iocp *ctx, ULONG_PTR key, LPOVERLAPPED overlapped)
+{
+	ior_iocp_op *const op = (ior_iocp_op *) overlapped;
+	// ior posts with key 0; a kernel packet carries the association key, a
+	// handle value
+	if (key == 0) {
+		return op;
+	}
+
+	const uintptr_t addr = (uintptr_t) op;
+	for (const iocp_op_chunk *chunk = atomic_load_explicit(&ctx->op_chunks, memory_order_acquire);
+			chunk; chunk = chunk->next) {
+		const uintptr_t first = (uintptr_t) chunk->ops;
+		if (addr < first || addr >= first + (uintptr_t) chunk->count * sizeof(ior_iocp_op)) {
+			continue;
+		}
+		if ((addr - first) % sizeof(ior_iocp_op) != 0) {
+			return NULL;
+		}
+		const int state = atomic_load_explicit(&op->state, memory_order_acquire);
+		if (state != IOCP_OP_IO && state != IOCP_OP_IO_CANCEL) {
+			return NULL;
+		}
+		return atomic_exchange(&op->packet_taken, true) ? NULL : op;
+	}
+
+	return NULL;
+}
+
+static void iocp_op_start_io(ior_iocp_op *op)
+{
+	atomic_store_explicit(&op->packet_taken, false, memory_order_relaxed);
+	atomic_store(&op->state, IOCP_OP_IO);
 }
 
 static ior_iocp_op *alloc_op(ior_ctx_iocp *ctx)
@@ -1379,7 +1431,7 @@ static int issue_read(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	uint64_t offset = op->offset == IOR_OFF_NONE ? 0 : op->offset;
 	op->overlapped.Offset = (DWORD) (offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (offset >> 32);
-	atomic_store(&op->state, IOCP_OP_IO);
+	iocp_op_start_io(op);
 
 	BOOL result = ReadFile(h, op->buf, op->len, NULL, &op->overlapped);
 	if (result) {
@@ -1413,7 +1465,7 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	// thing an overlapped handle has to a current position.
 	op->overlapped.Offset = (DWORD) (op->offset & 0xFFFFFFFF);
 	op->overlapped.OffsetHigh = (DWORD) (op->offset >> 32);
-	atomic_store(&op->state, IOCP_OP_IO);
+	iocp_op_start_io(op);
 
 	BOOL result = WriteFile(h, op->buf, op->len, NULL, &op->overlapped);
 	if (result) {
@@ -1453,7 +1505,7 @@ static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	op->wsabuf.buf = (CHAR *) op->buf;
 	op->wsabuf.len = op->len;
-	atomic_store(&op->state, IOCP_OP_IO);
+	iocp_op_start_io(op);
 
 	int rc = WSASend((SOCKET) op->fd, &op->wsabuf, 1, NULL, op->sock_flags, &op->overlapped, NULL);
 	if (rc == 0) {
@@ -1480,7 +1532,7 @@ static int issue_recv(ior_ctx_iocp *ctx, ior_iocp_op *op)
 
 	op->wsabuf.buf = (CHAR *) op->buf;
 	op->wsabuf.len = op->len;
-	atomic_store(&op->state, IOCP_OP_IO);
+	iocp_op_start_io(op);
 
 	// sock_flags is an in/out parameter for WSARecv and must remain valid for
 	// the whole async operation, hence it lives in the op.
@@ -1560,7 +1612,7 @@ static int issue_accept(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	}
 	op->accept_sock = as;
 	op->accept_recvd = 0;
-	atomic_store(&op->state, IOCP_OP_IO);
+	iocp_op_start_io(op);
 
 	// No data is received with the accept (dwReceiveDataLength 0), so the
 	// completion arrives as soon as a connection is there.
@@ -1620,7 +1672,7 @@ static int issue_connect(ior_ctx_iocp *ctx, ior_iocp_op *op)
 		}
 	}
 
-	atomic_store(&op->state, IOCP_OP_IO);
+	iocp_op_start_io(op);
 	BOOL ok = ctx->fn_connectex(s, op->sa, (int) op->sa_len_val, NULL, 0, NULL, &op->overlapped);
 	if (ok) {
 		atomic_fetch_add(&ctx->active_count, 1);
@@ -3877,8 +3929,8 @@ static void ior_iocp_backend_destroy(void *backend_ctx)
 			break;
 		}
 
-		if (overlapped) {
-			ior_iocp_op *op = (ior_iocp_op *) overlapped;
+		ior_iocp_op *const op = overlapped ? iocp_packet_op(ctx, key, overlapped) : NULL;
+		if (op) {
 			atomic_fetch_sub(&ctx->active_count, 1);
 			free_op(ctx, op);
 		}
@@ -4155,7 +4207,10 @@ static DWORD WINAPI iocp_pump_thread_main(LPVOID arg)
 			continue; // stray packet (external PostQueuedCompletionStatus)
 		}
 
-		ior_iocp_op *op = (ior_iocp_op *) overlapped;
+		ior_iocp_op *const op = iocp_packet_op(ctx, key, overlapped);
+		if (!op) {
+			continue;
+		}
 		op->pump_bytes = bytes;
 		op->pump_error = err;
 		op->pump_next = NULL;
@@ -4356,9 +4411,25 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		gle = e.error;
 		ok = gle == ERROR_SUCCESS;
 	} else {
-		ok = GetQueuedCompletionStatus(
-				ctx->iocp_handle, &bytes_transferred, &completion_key, &overlapped, timeout_ms);
-		gle = ok ? ERROR_SUCCESS : GetLastError();
+		const uint64_t deadline_ns
+				= timeout_ms == INFINITE ? 0 : qpc_now_ns() + (uint64_t) timeout_ms * 1000000;
+		DWORD wait_ms = timeout_ms;
+		for (int dropped = 0;;) {
+			ok = GetQueuedCompletionStatus(
+					ctx->iocp_handle, &bytes_transferred, &completion_key, &overlapped, wait_ms);
+			gle = ok ? ERROR_SUCCESS : GetLastError();
+			if (!overlapped || iocp_packet_op(ctx, completion_key, overlapped)) {
+				break;
+			}
+			if (++dropped == IOCP_FOREIGN_PACKETS_MAX) {
+				return -EAGAIN;
+			}
+			if (timeout_ms != INFINITE) {
+				const uint64_t now_ns = qpc_now_ns();
+				wait_ms = now_ns < deadline_ns ? (DWORD) ((deadline_ns - now_ns + 999999) / 1000000)
+											   : 0;
+			}
+		}
 	}
 
 	if (!ok) {
