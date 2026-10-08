@@ -12,6 +12,7 @@
  *   - teardown while operations are still in flight
  *   - a handle moving between rings (one completion port per handle), with
  *     recycled handle values, requests pending elsewhere and racing rings
+ *   - the errno of a closed or empty pipe
  *
  * The whole file compiles to an empty (passing) cmocka group on non-IOCP
  * builds, so it is harmless to register unconditionally in CMake - but the
@@ -675,6 +676,69 @@ static void test_handle_takeover_race(void **state)
 }
 
 /* ===================================================================== */
+/* Pipes                                                                 */
+/* ===================================================================== */
+
+// An overlapped duplex named pipe: *server for the ring, *client synchronous.
+static void make_pipe_pair(HANDLE *server, HANDLE *client)
+{
+	static unsigned pairs = 0;
+	char name[64];
+	snprintf(name, sizeof(name), "\\\\.\\pipe\\ior-test-%lu-%u", GetCurrentProcessId(), pairs++);
+	*server = CreateNamedPipeA(name,
+			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+			PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, NULL);
+	assert_true(*server != INVALID_HANDLE_VALUE);
+	*client = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	assert_true(*client != INVALID_HANDLE_VALUE);
+}
+
+static int32_t pipe_op_once(ior_ctx *ctx, HANDLE h, void *buf, unsigned len, int write)
+{
+	ior_sqe *const sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	if (write) {
+		ior_prep_write(ctx, sqe, h, buf, len, IOR_OFF_NONE);
+	} else {
+		ior_prep_read(ctx, sqe, h, buf, len, IOR_OFF_NONE);
+	}
+	assert_true(ior_submit(ctx) >= 0);
+	ior_cqe *cqe = NULL;
+	assert_return_code(ior_wait_cqe(ctx, &cqe), 0);
+	const int32_t res = ior_cqe_get_res(ctx, cqe);
+	ior_cqe_seen(ctx, cqe);
+	return res;
+}
+
+// A write to a pipe whose other end is closed fails with EPIPE, as on POSIX.
+static void test_write_to_closed_pipe_epipe(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	HANDLE server, client;
+	make_pipe_pair(&server, &client);
+	CloseHandle(client);
+
+	char byte = 'x';
+	assert_int_equal(pipe_op_once(s->ctx, server, &byte, 1, 1), -EPIPE);
+	CloseHandle(server);
+}
+
+// A read of an empty PIPE_NOWAIT pipe fails with EAGAIN, as on POSIX.
+static void test_read_empty_nowait_pipe_eagain(void **state)
+{
+	iocp_state *s = (iocp_state *) *state;
+	HANDLE server, client;
+	make_pipe_pair(&server, &client);
+	DWORD mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+	assert_true(SetNamedPipeHandleState(server, &mode, NULL, NULL));
+
+	char byte;
+	assert_int_equal(pipe_op_once(s->ctx, server, &byte, 1, 0), -EAGAIN);
+	CloseHandle(client);
+	CloseHandle(server);
+}
+
+/* ===================================================================== */
 /* Teardown with operations still in flight                              */
 /* ===================================================================== */
 
@@ -734,6 +798,9 @@ int main(void)
 		cmocka_unit_test_setup_teardown(test_handle_foreign_pending_busy, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_handle_socket_moves, iocp_setup, iocp_teardown),
 		cmocka_unit_test_setup_teardown(test_handle_takeover_race, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(test_write_to_closed_pipe_epipe, iocp_setup, iocp_teardown),
+		cmocka_unit_test_setup_teardown(
+				test_read_empty_nowait_pipe_eagain, iocp_setup, iocp_teardown),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 #else

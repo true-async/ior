@@ -2609,6 +2609,10 @@ static void op_to_cqe(ior_iocp_op *op)
 
 	if (op->submit_res) {
 		op->cqe.iocp.res = op->submit_res;
+	} else if (op->error_code == ERROR_NO_DATA) {
+		// A read of an empty PIPE_NOWAIT pipe, or a write to a pipe whose
+		// reading end is closed.
+		op->cqe.iocp.res = op->opcode == IOR_OP_READ ? -EAGAIN : -EPIPE;
 	} else if (op->error_code != ERROR_SUCCESS) {
 		op->cqe.iocp.res = win_error_to_errno(op->error_code);
 	} else if (op->opcode == IOR_OP_WORK || op->opcode == IOR_OP_POLL
