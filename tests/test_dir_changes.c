@@ -2,10 +2,11 @@
 /*
  * test_dir_changes.c - IOR_OP_DIR_CHANGES.
  *
- * On Windows: a file created in the directory, a change in a subdirectory
- * with and without IOR_DIR_CHANGES_SUBTREE, changes made between two ops
- * kept for the second, cancellation, and bad arguments. Elsewhere the op is
- * refused with -ENOTSUP and the feature is not reported.
+ * On Windows: the feature bit, a file created in the directory, a change in
+ * a subdirectory with and without IOR_DIR_CHANGES_SUBTREE, changes made
+ * between two ops kept for the second, cancellation, and bad arguments.
+ * Elsewhere the default and the threads backend refuse the op with -ENOTSUP
+ * and report no feature.
  */
 #include "test_utils.h"
 #ifdef _WIN32
@@ -122,7 +123,7 @@ static int32_t dc_reap(dc_state *s, int timeout_s)
 	return res;
 }
 
-/* Whether the records in the first len bytes name name with action */
+/* Whether a record in the first len bytes of buf reports the entry name with action */
 static bool dc_reported(const dc_state *s, int32_t len, DWORD action, const wchar_t *name)
 {
 	const char *at = (const char *) s->buf;
@@ -144,10 +145,15 @@ static bool dc_reported(const dc_state *s, int32_t len, DWORD action, const wcha
 	return false;
 }
 
-static void test_dir_changes_created(void **state)
+static void test_dir_changes_feature(void **state)
 {
 	dc_state *s = *state;
 	assert_true(ior_get_features(s->ctx) & IOR_FEAT_DIR_CHANGES);
+}
+
+static void test_dir_changes_created(void **state)
+{
+	dc_state *s = *state;
 	dc_submit(s, 0);
 	dc_touch(s, L"a.txt");
 	int32_t res = dc_reap(s, 5);
@@ -166,7 +172,11 @@ static void test_dir_changes_subtree(void **state)
 	assert_true(dc_reported(s, res, FILE_ACTION_ADDED, L"sub\\b.txt"));
 }
 
-/* Without the subtree flag a subdirectory's own entries are not reported */
+/*
+ * Without the subtree flag a subdirectory's own entries are not reported. The
+ * file in sub may first come out as sub's own change, so the ops go on until
+ * a.txt, made after it, is reported.
+ */
 static void test_dir_changes_no_subtree(void **state)
 {
 	dc_state *s = *state;
@@ -174,10 +184,20 @@ static void test_dir_changes_no_subtree(void **state)
 	dc_submit(s, 0);
 	dc_touch(s, L"sub\\b.txt");
 	dc_touch(s, L"a.txt");
-	int32_t res = dc_reap(s, 5);
-	assert_true(res > 0);
-	assert_true(dc_reported(s, res, FILE_ACTION_ADDED, L"a.txt"));
-	assert_false(dc_reported(s, res, FILE_ACTION_ADDED, L"sub\\b.txt"));
+
+	bool saw_a = false;
+	for (int i = 0; i < 4 && !saw_a; i++) {
+		if (i > 0) {
+			dc_submit(s, 0);
+		}
+
+		int32_t res = dc_reap(s, 5);
+		assert_true(res > 0);
+		assert_false(dc_reported(s, res, FILE_ACTION_ADDED, L"sub\\b.txt"));
+		saw_a = dc_reported(s, res, FILE_ACTION_ADDED, L"a.txt");
+	}
+
+	assert_true(saw_a);
 }
 
 /* The watch lives on the handle: what changes between two ops is kept */
@@ -233,6 +253,8 @@ static void test_dir_changes_bad_args(void **state)
 	assert_int_equal(
 			ior_prep_dir_changes(s->ctx, sqe, s->dir, (char *) s->buf + 1, sizeof(s->buf) - 4, 0),
 			-EINVAL);
+	assert_int_equal(
+			ior_prep_dir_changes(s->ctx, sqe, s->dir, s->buf, sizeof(s->buf), 1U << 1), -EINVAL);
 	ior_prep_nop(s->ctx, sqe);
 	assert_int_equal(ior_submit(s->ctx), 1);
 }
@@ -240,6 +262,7 @@ static void test_dir_changes_bad_args(void **state)
 int main(void)
 {
 	const struct CMUnitTest tests[] = {
+		cmocka_unit_test_setup_teardown(test_dir_changes_feature, setup_dc, teardown_dc),
 		cmocka_unit_test_setup_teardown(test_dir_changes_created, setup_dc, teardown_dc),
 		cmocka_unit_test_setup_teardown(test_dir_changes_subtree, setup_dc, teardown_dc),
 		cmocka_unit_test_setup_teardown(test_dir_changes_no_subtree, setup_dc, teardown_dc),
@@ -252,16 +275,32 @@ int main(void)
 
 #else /* !_WIN32 */
 
+/* The op is refused on ctx's backend, with no feature bit */
+static void dc_refused(ior_ctx *ctx)
+{
+	char buf[64] __attribute__((aligned(4)));
+	assert_false(ior_get_features(ctx) & IOR_FEAT_DIR_CHANGES);
+	ior_sqe *sqe = ior_get_sqe(ctx);
+	assert_non_null(sqe);
+	assert_int_equal(ior_prep_dir_changes(ctx, sqe, 0, buf, sizeof(buf), 0), -ENOTSUP);
+	ior_prep_nop(ctx, sqe);
+	assert_int_equal(ior_submit(ctx), 1);
+}
+
 static void test_dir_changes_unsupported(void **state)
 {
 	test_state *ts = *state;
-	char buf[64] __attribute__((aligned(4)));
-	assert_false(ior_get_features(ts->ctx) & IOR_FEAT_DIR_CHANGES);
-	ior_sqe *sqe = ior_get_sqe(ts->ctx);
-	assert_non_null(sqe);
-	assert_int_equal(ior_prep_dir_changes(ts->ctx, sqe, 0, buf, sizeof(buf), 0), -ENOTSUP);
-	ior_prep_nop(ts->ctx, sqe);
-	assert_int_equal(ior_submit(ts->ctx), 1);
+	dc_refused(ts->ctx);
+}
+
+static void test_dir_changes_unsupported_threads(void **state)
+{
+	(void) state;
+	ior_ctx *ctx;
+	ior_params params = { .sq_entries = 32, .cq_entries = 64, .backend = IOR_BACKEND_THREADS };
+	assert_return_code(ior_queue_init_params(32, &ctx, &params), 0);
+	dc_refused(ctx);
+	ior_queue_exit(ctx);
 }
 
 int main(void)
@@ -269,6 +308,7 @@ int main(void)
 	const struct CMUnitTest tests[] = {
 		cmocka_unit_test_setup_teardown(
 				test_dir_changes_unsupported, setup_ior_ctx, teardown_ior_ctx),
+		cmocka_unit_test(test_dir_changes_unsupported_threads),
 	};
 	return cmocka_run_group_tests(tests, NULL, NULL);
 }

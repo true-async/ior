@@ -481,7 +481,8 @@ int ior_prep_sigwait(ior_ctx *ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_si
 int ior_prep_dir_changes(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t dir, void *buf, unsigned nbytes, uint32_t flags)
 {
-	if (!ctx || !sqe || !buf || nbytes == 0 || ((uintptr_t) buf & 3)) {
+	if (!ctx || !sqe || !buf || nbytes == 0 || ((uintptr_t) buf & 3)
+			|| (flags & ~IOR_DIR_CHANGES_SUBTREE)) {
 		return -EINVAL;
 	}
 	if (!ctx->ops->prep_dir_changes) {

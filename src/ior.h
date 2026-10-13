@@ -1073,17 +1073,19 @@ int ior_sigrequeue(const ior_siginfo_t *info);
  *
  * Completes with the number of bytes written to @p buf as res: a chain of
  * FILE_NOTIFY_INFORMATION records, linked by NextEntryOffset, for the names
- * created, removed, renamed or modified (their data, size, attributes,
- * times or security) since the previous op on the handle. 0 means changes
- * were lost because the system's buffer overflowed: the caller rescans the
- * directory. -ECANCELED when cancelled; an error of the directory itself
- * (removed, its volume gone) as a negative errno.
+ * created, removed or renamed and the entries whose attributes, size, write,
+ * access or creation time or security changed. Changes of the directory
+ * itself are not reported. 0 means the records did not fit, the system's
+ * buffer or @p buf: changes were lost, and the caller enumerates the
+ * directory. -ECANCELED when cancelled.
  *
  * The first op on a handle starts the watch, and the system keeps the
- * changes that come between ops, so one op is submitted again as soon as
- * the previous completes. The handle is a directory opened with
- * FILE_LIST_DIRECTORY and FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED;
- * it is tied to the context's port, as a read's is.
+ * changes that come between ops in a buffer the size of that op's @p buf,
+ * for the handle's life. So every op on a handle uses the same @p flags and
+ * @p nbytes, and the next one follows each completion at once. The handle is a
+ * directory opened with FILE_LIST_DIRECTORY and FILE_FLAG_BACKUP_SEMANTICS |
+ * FILE_FLAG_OVERLAPPED; the op associates it with the context's completion
+ * port, as a read does (see ior_release_handle()).
  *
  * Windows only: other backends return -ENOTSUP, and report no
  * IOR_FEAT_DIR_CHANGES.
@@ -1091,11 +1093,11 @@ int ior_sigrequeue(const ior_siginfo_t *info);
  * @param ctx     I/O context.
  * @param sqe     Entry from ior_get_sqe().
  * @param dir     The directory's handle.
- * @param buf     DWORD-aligned; valid until the completion arrives.
+ * @param buf     Must be DWORD-aligned; valid until the completion arrives.
  * @param nbytes  Size of @p buf, at most 64 KiB for a directory on a share.
  * @param flags   IOR_DIR_CHANGES_SUBTREE or 0.
- * @return 0 on success, -EINVAL for a NULL or unaligned @p buf or a zero
- *         @p nbytes, or -ENOTSUP.
+ * @return 0 on success, -EINVAL for a NULL or unaligned @p buf, a zero
+ *         @p nbytes or an unknown flag, or -ENOTSUP.
  */
 int ior_prep_dir_changes(
 		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t dir, void *buf, unsigned nbytes, uint32_t flags);

@@ -106,12 +106,11 @@ typedef struct ior_iocp_op {
 	void *buf;
 	uint32_t len;
 	uint64_t offset;
-	bool dir_subtree; // IOR_OP_DIR_CHANGES: IOR_DIR_CHANGES_SUBTREE
 
 	// Socket I/O (WSASend/WSARecv) bookkeeping. The WSABUF and flags must stay
 	// valid for the whole lifetime of the overlapped operation, so they live in
 	// the op rather than on the issuing thread's stack. For WSARecv sock_flags
-	// is an in/out parameter.
+	// is an in/out parameter; IOR_OP_DIR_CHANGES keeps its flags there too.
 	WSABUF wsabuf;
 	DWORD sock_flags;
 
@@ -1234,6 +1233,7 @@ typedef NTSTATUS(NTAPI *ior_nt_set_information_file_fn)(
 #define IOR_STATUS_NOT_IMPLEMENTED ((NTSTATUS) 0xC0000002L)
 #define IOR_STATUS_INVALID_INFO_CLASS ((NTSTATUS) 0xC0000003L)
 #define IOR_STATUS_BUFFER_OVERFLOW ((NTSTATUS) 0x80000005L)
+#define IOR_STATUS_NOTIFY_ENUM_DIR ((NTSTATUS) 0x0000010CL)
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(status) (((NTSTATUS) (status)) >= 0)
 #endif
@@ -1593,6 +1593,47 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
 	return post_synthetic_completion(ctx, op, err, 0);
 }
 
+// What IOR_OP_DIR_CHANGES reports, libuv's filter: names, attributes, size,
+// write, access and creation times, security
+#define IOR_DIR_CHANGES_FILTER \
+	(FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES \
+			| FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE \
+			| FILE_NOTIFY_CHANGE_LAST_ACCESS | FILE_NOTIFY_CHANGE_CREATION \
+			| FILE_NOTIFY_CHANGE_SECURITY)
+
+/*
+ * issue_dir_changes: a completion packet follows as for ReadFile. Not in
+ * reissue_collateral_abort: a CancelIoEx on a directory cancels only the
+ * request it names, unlike one on an AFD socket.
+ */
+static int issue_dir_changes(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	HANDLE h = op->fd;
+
+	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
+	if (ret < 0) {
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
+	}
+
+	iocp_op_start_io(op);
+	if (ReadDirectoryChangesW(h, op->buf, op->len,
+				(op->sock_flags & IOR_DIR_CHANGES_SUBTREE) ? TRUE : FALSE, IOR_DIR_CHANGES_FILTER,
+				NULL, &op->overlapped, NULL)) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	// STATUS_NOTIFY_ENUM_DIR is a success status: its packet is queued
+	DWORD err = GetLastError();
+	if (err == ERROR_IO_PENDING
+			|| (NTSTATUS) op->overlapped.Internal == IOR_STATUS_NOTIFY_ENUM_DIR) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	return post_synthetic_completion(ctx, op, err, 0);
+}
+
 /*
  * issue_send / issue_recv
  *
@@ -1606,48 +1647,6 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * The op's fd is an ior_fd_t (HANDLE); sockets created with WSA_FLAG_OVERLAPPED
  * are valid IOCP targets, so we cast the handle to SOCKET for the Winsock call.
  */
-// What IOR_OP_DIR_CHANGES reports: every change libuv's fs-event watches
-#define IOR_DIR_CHANGES_FILTER \
-	(FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES \
-			| FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE \
-			| FILE_NOTIFY_CHANGE_LAST_ACCESS | FILE_NOTIFY_CHANGE_CREATION \
-			| FILE_NOTIFY_CHANGE_SECURITY)
-
-/*
- * issue_dir_changes: a completion packet follows as for ReadFile. A cancel
- * names this request alone (CancelIoEx on a directory is not AFD), so it is
- * never re-issued as collateral.
- */
-static int issue_dir_changes(ior_ctx_iocp *ctx, ior_iocp_op *op)
-{
-	HANDLE h = op->fd;
-
-	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
-	if (ret < 0) {
-		return post_synthetic_completion(ctx, op, association_error(ret), 0);
-	}
-
-	iocp_op_start_io(op);
-	if (ReadDirectoryChangesW(h, op->buf, op->len, op->dir_subtree ? TRUE : FALSE,
-				IOR_DIR_CHANGES_FILTER, NULL, &op->overlapped, NULL)) {
-		atomic_fetch_add(&ctx->active_count, 1);
-		return 0;
-	}
-
-	DWORD err = GetLastError();
-	if (err == ERROR_IO_PENDING) {
-		atomic_fetch_add(&ctx->active_count, 1);
-		return 0;
-	}
-
-	// Changes lost: 0 bytes, as a completion reports them
-	if (err == ERROR_NOTIFY_ENUM_DIR) {
-		return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
-	}
-
-	return post_synthetic_completion(ctx, op, err, 0);
-}
-
 static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
@@ -4650,7 +4649,7 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		// a truncated datagram.
 		const bool partial = gle == ERROR_MORE_DATA
 				&& (op->opcode == IOR_OP_READ || op->opcode == IOR_OP_RECV);
-		// Changes lost: 0 bytes, which the caller takes for a rescan
+		// Changes lost, should the port report it as an error: 0 bytes, a rescan
 		const bool dir_overflow = gle == ERROR_NOTIFY_ENUM_DIR && op->opcode == IOR_OP_DIR_CHANGES;
 		op->error_code = (partial || dir_overflow) ? ERROR_SUCCESS : gle;
 		op->bytes_transferred = (ok || partial) ? bytes_transferred : 0;
@@ -5155,7 +5154,7 @@ static void ior_iocp_backend_prep_dir_changes(
 	op->fd = dir;
 	op->buf = buf;
 	op->len = nbytes;
-	op->dir_subtree = (flags & IOR_DIR_CHANGES_SUBTREE) != 0;
+	op->sock_flags = flags;
 }
 
 static int ior_iocp_backend_prep_waitpid(
