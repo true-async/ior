@@ -106,6 +106,7 @@ typedef struct ior_iocp_op {
 	void *buf;
 	uint32_t len;
 	uint64_t offset;
+	bool dir_subtree; // IOR_OP_DIR_CHANGES: IOR_DIR_CHANGES_SUBTREE
 
 	// Socket I/O (WSASend/WSARecv) bookkeeping. The WSABUF and flags must stay
 	// valid for the whole lifetime of the overlapped operation, so they live in
@@ -1288,6 +1289,7 @@ static bool iocp_op_binds_handle(const ior_iocp_op *op, HANDLE h)
 		case IOR_OP_RECV:
 		case IOR_OP_ACCEPT:
 		case IOR_OP_CONNECT:
+		case IOR_OP_DIR_CHANGES:
 			return true;
 		default:
 			return false;
@@ -1604,6 +1606,48 @@ static int issue_write(ior_ctx_iocp *ctx, ior_iocp_op *op)
  * The op's fd is an ior_fd_t (HANDLE); sockets created with WSA_FLAG_OVERLAPPED
  * are valid IOCP targets, so we cast the handle to SOCKET for the Winsock call.
  */
+// What IOR_OP_DIR_CHANGES reports: every change libuv's fs-event watches
+#define IOR_DIR_CHANGES_FILTER \
+	(FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_ATTRIBUTES \
+			| FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE \
+			| FILE_NOTIFY_CHANGE_LAST_ACCESS | FILE_NOTIFY_CHANGE_CREATION \
+			| FILE_NOTIFY_CHANGE_SECURITY)
+
+/*
+ * issue_dir_changes: a completion packet follows as for ReadFile. A cancel
+ * names this request alone (CancelIoEx on a directory is not AFD), so it is
+ * never re-issued as collateral.
+ */
+static int issue_dir_changes(ior_ctx_iocp *ctx, ior_iocp_op *op)
+{
+	HANDLE h = op->fd;
+
+	int ret = ensure_handle_associated(ctx, h, &op->io_cancel_gen, &op->io_epoch);
+	if (ret < 0) {
+		return post_synthetic_completion(ctx, op, association_error(ret), 0);
+	}
+
+	iocp_op_start_io(op);
+	if (ReadDirectoryChangesW(h, op->buf, op->len, op->dir_subtree ? TRUE : FALSE,
+				IOR_DIR_CHANGES_FILTER, NULL, &op->overlapped, NULL)) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	DWORD err = GetLastError();
+	if (err == ERROR_IO_PENDING) {
+		atomic_fetch_add(&ctx->active_count, 1);
+		return 0;
+	}
+
+	// Changes lost: 0 bytes, as a completion reports them
+	if (err == ERROR_NOTIFY_ENUM_DIR) {
+		return post_synthetic_completion(ctx, op, ERROR_SUCCESS, 0);
+	}
+
+	return post_synthetic_completion(ctx, op, err, 0);
+}
+
 static int issue_send(ior_ctx_iocp *ctx, ior_iocp_op *op)
 {
 	int ret = ensure_handle_associated(ctx, op->fd, &op->io_cancel_gen, &op->io_epoch);
@@ -3246,6 +3290,7 @@ static bool iocp_op_has_fd(uint8_t opcode)
 		case IOR_OP_POLL:
 		case IOR_OP_ACCEPT:
 		case IOR_OP_CONNECT:
+		case IOR_OP_DIR_CHANGES:
 			return true;
 		default:
 			return false;
@@ -3665,6 +3710,10 @@ static int issue_op(ior_ctx_iocp *ctx, ior_iocp_op *op)
 				ret = issue_sigwait(ctx, op);
 				break;
 
+			case IOR_OP_DIR_CHANGES:
+				ret = issue_dir_changes(ctx, op);
+				break;
+
 			case IOR_OP_TIMER:
 				ret = arm_timer(ctx, op);
 				break;
@@ -3842,7 +3891,8 @@ static int ior_iocp_backend_init(void **backend_ctx, ior_params *params)
 
 	atomic_store(&ctx->shutdown, 0);
 
-	ctx->features = IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK | IOR_FEAT_POLL_ADD;
+	ctx->features
+			= IOR_FEAT_NATIVE_ASYNC | IOR_FEAT_WORK | IOR_FEAT_POLL_ADD | IOR_FEAT_DIR_CHANGES;
 	params->sq_entries = ctx->sq_size;
 	params->cq_entries = ctx->ready.size;
 	params->features = ctx->features;
@@ -4574,7 +4624,9 @@ static int dequeue_one_completion(ior_ctx_iocp *ctx, DWORD timeout_ms)
 		// a truncated datagram.
 		const bool partial = gle == ERROR_MORE_DATA
 				&& (op->opcode == IOR_OP_READ || op->opcode == IOR_OP_RECV);
-		op->error_code = partial ? ERROR_SUCCESS : gle;
+		// Changes lost: 0 bytes, which the caller takes for a rescan
+		const bool dir_overflow = gle == ERROR_NOTIFY_ENUM_DIR && op->opcode == IOR_OP_DIR_CHANGES;
+		op->error_code = (partial || dir_overflow) ? ERROR_SUCCESS : gle;
 		op->bytes_transferred = (ok || partial) ? bytes_transferred : 0;
 		atomic_store(&op->state, IOCP_OP_DONE);
 	}
@@ -5068,6 +5120,18 @@ static void ior_iocp_backend_prep_connect(
 	op->sa_len_val = addrlen;
 }
 
+static void ior_iocp_backend_prep_dir_changes(
+		ior_sqe *sqe, ior_fd_t dir, void *buf, unsigned nbytes, uint32_t flags)
+{
+	ior_iocp_op *op = (ior_iocp_op *) sqe;
+	memset(&op->overlapped, 0, sizeof(OVERLAPPED));
+	op->opcode = IOR_OP_DIR_CHANGES;
+	op->fd = dir;
+	op->buf = buf;
+	op->len = nbytes;
+	op->dir_subtree = (flags & IOR_DIR_CHANGES_SUBTREE) != 0;
+}
+
 static int ior_iocp_backend_prep_waitpid(
 		void *backend_ctx, ior_sqe *sqe, ior_pid_t pid, int *status, int options)
 {
@@ -5243,6 +5307,7 @@ const ior_backend_ops ior_iocp_ops = {
 	.prep_cancel_fd = ior_iocp_backend_prep_cancel_fd,
 	.prep_waitpid = ior_iocp_backend_prep_waitpid,
 	.prep_sigwait = ior_iocp_backend_prep_sigwait,
+	.prep_dir_changes = ior_iocp_backend_prep_dir_changes,
 	.prep_work = ior_iocp_backend_prep_work,
 	.sqe_set_data = ior_iocp_backend_sqe_set_data,
 	.sqe_set_flags = ior_iocp_backend_sqe_set_flags,

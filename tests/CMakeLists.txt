@@ -36,6 +36,7 @@ set(TESTS
     test_accept_connect
     test_waitpid
     test_sigwait
+    test_dir_changes
 )
 
 # Add test for splice only on Linux with splice support

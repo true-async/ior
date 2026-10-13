@@ -40,6 +40,7 @@ static inline int ior_fixed_file_bad(uint8_t opcode, uint8_t sqe_flags, uint32_t
 		case IOR_OP_SEND:
 		case IOR_OP_RECV:
 		case IOR_OP_POLL:
+		case IOR_OP_DIR_CHANGES:
 			return 1;
 		case IOR_OP_ASYNC_CANCEL:
 			return (cancel_flags & IOR_CANCEL_BY_FD) != 0;
@@ -208,6 +209,9 @@ typedef struct ior_backend_ops {
 	 * has been validated as non-empty. */
 	int (*prep_sigwait)(
 			void *backend_ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_siginfo_t *info);
+	/* Optional (NULL = directory change ops unsupported). Arguments checked. */
+	void (*prep_dir_changes)(
+			ior_sqe *sqe, ior_fd_t dir, void *buf, unsigned nbytes, uint32_t flags);
 	/* Optional (NULL = work ops unsupported). Takes backend_ctx because some
 	 * backends record per-op state beyond the SQE (e.g. io_uring's job list). */
 	int (*prep_work)(void *backend_ctx, ior_sqe *sqe, ior_work_fn fn, void *arg);

@@ -478,6 +478,19 @@ int ior_prep_sigwait(ior_ctx *ctx, ior_sqe *sqe, const ior_sigset_t *set, ior_si
 	return ctx->ops->prep_sigwait(ctx->backend_ctx, sqe, set, info);
 }
 
+int ior_prep_dir_changes(
+		ior_ctx *ctx, ior_sqe *sqe, ior_fd_t dir, void *buf, unsigned nbytes, uint32_t flags)
+{
+	if (!ctx || !sqe || !buf || nbytes == 0 || ((uintptr_t) buf & 3)) {
+		return -EINVAL;
+	}
+	if (!ctx->ops->prep_dir_changes) {
+		return -ENOTSUP;
+	}
+	ctx->ops->prep_dir_changes(sqe, dir, buf, nbytes, flags);
+	return 0;
+}
+
 void ior_prep_cancel(ior_ctx *ctx, ior_sqe *sqe, void *user_data)
 {
 	if (ctx && sqe) {
